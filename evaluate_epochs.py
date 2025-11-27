@@ -1,36 +1,32 @@
 #!/usr/bin/env python3
-import argparse
+import os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Tuple, Dict, List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    average_precision_score,
-    roc_auc_score,
-)
+from sklearn.metrics import average_precision_score, confusion_matrix, accuracy_score
 
-INPUT_DEFAULT = "output/stablediffusion3-sd3-v3.csv"
+OUT_BASE = Path("output")
+EPOCH_DIR_FMT = "curriculum_epoch{epoch}"
+CSV_NAME = "stablediffusion3-sd3-v3.csv"
 METRIC_DIR = Path("metric_output")
+EPOCHS = list(range(0, 11))  # 0..10 inclusive
 
-# Column fallbacks (adjust if your CSV uses different names)
+# Column fallbacks
 POSSIBLE_LABELS = ["class", "label", "target", "y"]
 POSSIBLE_IMAGE = ["image", "path", "filepath"]
-SCORE_COL = "spai"  # column populated by your infer step
+SCORE_COL = "spai"  # column created by spai infer
 
 def _find_col(df: pd.DataFrame, candidates: List[str]) -> str:
     for c in candidates:
         if c in df.columns:
             return c
-    raise KeyError(f"None of {candidates} found in columns: {list(df.columns)}")
+    raise KeyError(f"None of the expected columns {candidates} found. Got: {list(df.columns)}")
 
 def _subset_mask(df: pd.DataFrame, y_col: str, img_col: str, which: str) -> np.ndarray:
-    if which == "overall":
-        return np.ones(len(df), dtype=bool)
-
+    """Return boolean mask for the requested subset."""
     y = df[y_col].astype(int).values
     img = df[img_col].astype(str).str.lower().fillna("")
     is_real = (y == 0)
@@ -44,136 +40,150 @@ def _subset_mask(df: pd.DataFrame, y_col: str, img_col: str, which: str) -> np.n
     else:
         raise ValueError(which)
 
-def _best_threshold_for_accuracy(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, float]:
-    if len(y_true) == 0:
-        return np.nan, np.nan
+def _best_threshold_for_accuracy(y_true: np.ndarray, scores: np.ndarray) -> Tuple[float, float, float, float]:
+    """
+    Sweep thresholds in [0,1] to maximize accuracy.
+    Returns (best_acc, best_thr, tpr_at_best, tnr_at_best).
+    """
+    # if scores are all same, any threshold; handle gracefully
     if np.all(scores == scores[0]):
         thr = 0.5
-        acc = accuracy_score(y_true, (scores >= thr).astype(int))
-        return float(acc), float(thr)
+        y_pred = (scores >= thr).astype(int)
+        acc = accuracy_score(y_true, y_pred)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        return acc, thr, tpr, tnr
+
+    # Use a dense grid for robustness (fast enough) – avoids O(N) unique thresholds degenerate cases
     grid = np.linspace(0.0, 1.0, 1001)
-    best_acc, best_thr = -1.0, 0.5
+    best_acc = -1.0
+    best_thr = 0.5
+    best_tpr = 0.0
+    best_tnr = 0.0
+
     for thr in grid:
-        acc = accuracy_score(y_true, (scores >= thr).astype(int))
+        pred = (scores >= thr).astype(int)
+        acc = accuracy_score(y_true, pred)
+        tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0,1]).ravel()
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
         if acc > best_acc:
-            best_acc, best_thr = acc, thr
-    return float(best_acc), float(best_thr)
+            best_acc = acc
+            best_thr = thr
+            best_tpr = tpr
+            best_tnr = tnr
 
-def _tpr_tnr_at_threshold(y_true: np.ndarray, scores: np.ndarray, thr: float) -> Tuple[float, float]:
-    if len(y_true) == 0:
-        return np.nan, np.nan
-    y_pred = (scores >= thr).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    tpr = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-    tnr = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-    return float(tpr), float(tnr)
-
-def _safe_ap(y_true: np.ndarray, scores: np.ndarray) -> float:
-    if y_true.size == 0 or len(np.unique(y_true)) < 2:
-        return np.nan
-    return float(average_precision_score(y_true, scores))
-
-def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
-    if y_true.size == 0 or len(np.unique(y_true)) < 2:
-        return np.nan
-    return float(roc_auc_score(y_true, scores))
+    return best_acc, float(best_thr), float(best_tpr), float(best_tnr)
 
 def _metrics_for_subset(df: pd.DataFrame, y_col: str, img_col: str, subset_name: str) -> Dict[str, float]:
     mask = _subset_mask(df, y_col, img_col, subset_name)
     sub = df.loc[mask].copy()
     if sub.empty:
+        # Return NaNs if subset has no rows
         return {
             "n": 0,
             "acc@0.5": np.nan,
-            "tpr@0.5": np.nan,
-            "tnr@0.5": np.nan,
-            "ap": np.nan,
-            "auc": np.nan,
             "oracle_acc": np.nan,
             "oracle_thr": np.nan,
+            "ap": np.nan,
+            "tpr@oracle": np.nan,
+            "tnr@oracle": np.nan,
         }
+
     y = sub[y_col].astype(int).values
     s = sub[SCORE_COL].astype(float).values
 
-    acc05 = accuracy_score(y, (s >= 0.5).astype(int))
-    tpr05, tnr05 = _tpr_tnr_at_threshold(y, s, 0.5)
-    ap = _safe_ap(y, s)
-    auc = _safe_auc(y, s)
-    best_acc, best_thr = _best_threshold_for_accuracy(y, s)
+    # acc at 0.5
+    y_pred_05 = (s >= 0.5).astype(int)
+    acc05 = accuracy_score(y, y_pred_05)
+
+    # oracle acc (best threshold)
+    best_acc, best_thr, tpr, tnr = _best_threshold_for_accuracy(y, s)
+
+    # AP
+    # Guard: if subset has only one class, AP is undefined; sklearn returns 1.0 if all true are 1?
+    # We'll handle class-imbalance by returning NaN if only one class exists
+    if len(np.unique(y)) == 1:
+        ap = np.nan
+    else:
+        ap = average_precision_score(y, s)
 
     return {
         "n": int(len(sub)),
         "acc@0.5": float(acc05),
-        "tpr@0.5": float(tpr05) if tpr05 == tpr05 else np.nan,
-        "tnr@0.5": float(tnr05) if tnr05 == tnr05 else np.nan,
-        "ap": float(ap) if ap == ap else np.nan,
-        "auc": float(auc) if auc == auc else np.nan,
         "oracle_acc": float(best_acc),
         "oracle_thr": float(best_thr),
+        "ap": float(ap) if ap == ap else np.nan,
+        "tpr@oracle": float(tpr),
+        "tnr@oracle": float(tnr),
     }
 
-def plot_metrics(df_metrics: pd.DataFrame, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    subsets = list(df_metrics["subset"].unique())
+def main():
+    METRIC_DIR.mkdir(parents=True, exist_ok=True)
+    rows = []
 
-    def _bar(metric: str, ylabel: str, fname: str, ylim=None):
+    for i in EPOCHS:
+        csv_path = OUT_BASE / EPOCH_DIR_FMT.format(epoch=i) / CSV_NAME
+        if not csv_path.exists():
+            print(f"[warn] missing CSV for epoch {i}: {csv_path}")
+            continue
+
+        df = pd.read_csv(csv_path)
+
+        # --- Column detection
+        if SCORE_COL not in df.columns:
+            raise KeyError(f"Score column '{SCORE_COL}' not found in {csv_path}")
+        y_col = _find_col(df, POSSIBLE_LABELS)
+        img_col = _find_col(df, POSSIBLE_IMAGE)
+
+        # --- Keep split=val if present
+        if "split" in df.columns:
+            df = df[df["split"] == "val"].copy()
+
+        # --- Coerce types
+        df[y_col] = df[y_col].astype(int)
+        df[SCORE_COL] = pd.to_numeric(df[SCORE_COL], errors="coerce")
+        df = df.dropna(subset=[SCORE_COL])
+
+        # --- Compute metrics for both subsets
+        for subset in ("real+matched", "real+synthetic"):
+            m = _metrics_for_subset(df, y_col, img_col, subset)
+            row = {"epoch": i, "subset": subset, **m}
+            rows.append(row)
+
+    if not rows:
+        print("[error] No metrics computed (no CSVs found or empty data).")
+        return
+
+    results = pd.DataFrame(rows).sort_values(["subset", "epoch"])
+    results_path = METRIC_DIR / "curriculum_metrics.csv"
+    results.to_csv(results_path, index=False)
+    print(f"[info] wrote {results_path}")
+
+    # --------- PLOTS ----------
+    def plot_metric(metric: str, ylabel: str, fname: str, ylim: Tuple[float,float] | None = None):
         plt.figure()
-        vals = [df_metrics.loc[df_metrics["subset"] == s, metric].values[0] for s in subsets]
-        xpos = np.arange(len(subsets))
-        plt.bar(xpos, vals)
-        plt.xticks(xpos, subsets, rotation=15)
+        for subset in ("real+matched", "real+synthetic"):
+            d = results[results["subset"] == subset]
+            plt.plot(d["epoch"], d[metric], marker="o", label=subset)
+        plt.xlabel("epoch")
         plt.ylabel(ylabel)
         if ylim is not None:
             plt.ylim(*ylim)
-        plt.grid(axis="y", alpha=0.3)
-        outp = out_dir / fname
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        outp = METRIC_DIR / fname
         plt.savefig(outp, bbox_inches="tight", dpi=150)
         plt.close()
+        print(f"[info] saved {outp}")
 
-    _bar("acc@0.5", "Accuracy @ 0.5", "acc_at_0p5.png", ylim=(0,1))
-    _bar("oracle_acc", "Oracle Accuracy", "oracle_acc.png", ylim=(0,1))
-    _bar("oracle_thr", "Best Threshold", "oracle_threshold.png")
-    _bar("ap", "Average Precision", "ap.png", ylim=(0,1))
-    _bar("auc", "AUC", "auc.png", ylim=(0,1))
-    _bar("tpr@0.5", "TPR @ 0.5", "tpr_at_0p5.png", ylim=(0,1))
-    _bar("tnr@0.5", "TNR @ 0.5", "tnr_at_0p5.png", ylim=(0,1))
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default=INPUT_DEFAULT, help="Path to the single output CSV to evaluate")
-    ap.add_argument("--out", default=str(METRIC_DIR), help="Directory to write metric CSV/plots")
-    args = ap.parse_args()
-
-    csv_path = Path(args.csv)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    df = pd.read_csv(csv_path)
-
-    if SCORE_COL not in df.columns:
-        raise KeyError(f"Score column '{SCORE_COL}' not found in {csv_path}. Have: {list(df.columns)}")
-    y_col = _find_col(df, POSSIBLE_LABELS)
-    img_col = _find_col(df, POSSIBLE_IMAGE)
-
-    # keep only split=val if present
-    if "split" in df.columns:
-        df = df[df["split"] == "val"].copy()
-
-    df[y_col] = df[y_col].astype(int)
-    df[SCORE_COL] = pd.to_numeric(df[SCORE_COL], errors="coerce")
-    df = df.dropna(subset=[SCORE_COL])
-
-    rows = []
-    for subset in ("overall", "real+matched", "real+synthetic"):
-        m = _metrics_for_subset(df, y_col, img_col, subset)
-        rows.append({"subset": subset, **m})
-
-    metrics_df = pd.DataFrame(rows)
-    out_csv = out_dir / "metrics_single_file.csv"
-    metrics_df.to_csv(out_csv, index=False)
-    print(f"[info] wrote {out_csv}")
-
-    plot_metrics(metrics_df, out_dir)
+    plot_metric("acc@0.5", "Accuracy @ 0.5", "acc_at_0p5.png", ylim=(0,1))
+    plot_metric("oracle_acc", "Oracle Accuracy", "oracle_acc.png", ylim=(0,1))
+    plot_metric("oracle_thr", "Best Threshold", "oracle_threshold.png", ylim=(0,1))
+    plot_metric("ap", "Average Precision", "ap.png", ylim=(0,1))
+    plot_metric("tpr@oracle", "TPR @ Best Thr", "tpr_at_oracle.png", ylim=(0,1))
+    plot_metric("tnr@oracle", "TNR @ Best Thr", "tnr_at_oracle.png", ylim=(0,1))
 
 if __name__ == "__main__":
     main()
