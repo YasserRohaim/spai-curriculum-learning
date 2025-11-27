@@ -36,6 +36,16 @@ DATA:
   NUM_WORKERS: 8
   AUGMENTED_VIEWS: 4
   TEST_PREFETCH_FACTOR: 1
+  CURRICULUM:
+    ENABLED: true
+    START_MATCHED_FRACTION: 0.0
+    END_MATCHED_FRACTION: 0.5
+    RAMP_EPOCHS: 10
+    PAIR_WITH_SYNTH: false        # existing behavior (filter matched by synth stems)
+    PAIR_WITH_REAL:  true         # NEW: filter matched & synth by real stems
+    REQUIRE_BOTH_FOR_MATCHED: false  # optional: if true, matched must have real AND synth
+
+
 AUG:
   COLOR_JITTER: 0.
 TRAIN:

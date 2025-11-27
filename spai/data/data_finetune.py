@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import collections
+import logging
 import pathlib
 import random
 from functools import partial
@@ -38,6 +39,8 @@ import filetype
 from spai.data import readers
 from spai.data import filestorage
 from spai import data_utils
+
+logger = logging.getLogger(__name__)
 
 
 class CSVDataset(torch.utils.data.Dataset):
@@ -150,6 +153,12 @@ class CSVDataset(torch.utils.data.Dataset):
         values: dict[int, Any],
         export_dir: Optional[pathlib.Path] = None
     ) -> None:
+        from pathlib import Path
+
+        export_dir = Path(export_dir)
+        csv_path = self.csv_path if isinstance(self.csv_path, Path) else Path(self.csv_path)
+        export_path = export_dir / csv_path.name
+    # ...
         for idx, v in values.items():
             self.entries[idx][column_name] = v
 
@@ -159,6 +168,7 @@ class CSVDataset(torch.utils.data.Dataset):
                 e[column_name] = ""
 
         if export_dir:
+            self.csv_path= Path(self.csv_path)
             export_path: pathlib.Path = export_dir / self.csv_path.name
             data_utils.write_csv_file(self.entries, export_path, delimiter=",")
 
@@ -177,6 +187,151 @@ class CSVDataset(torch.utils.data.Dataset):
                 filestorage.LMDBFileStorage(self.lmdb_storage, read_only=True)
             )
 
+
+class CurriculumCSVDataset(CSVDataset):
+    def __init__(
+        self,
+        *args,
+        matched_schedule: Callable[[int], float],
+        pair_matched: bool = True,              # keeps old CLI/config name working
+        pair_with_synth: Optional[bool] = None, # read from config if passed
+        pair_with_real: bool = False,           # NEW
+        require_both_for_matched: bool = False, # NEW
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.matched_schedule = matched_schedule
+
+        # Back-compat: if caller passed pair_matched, treat as PAIR_WITH_SYNTH unless overridden.
+        if pair_with_synth is None:
+            pair_with_synth = pair_matched
+
+        self.pair_with_synth = bool(pair_with_synth)
+        self.pair_with_real = bool(pair_with_real)
+        self.require_both_for_matched = bool(require_both_for_matched)
+
+        self.real_idx: list[int] = []
+        self.synth_idx: list[int] = []
+        self.matched_idx: list[int] = []
+
+        # Build index lists + stem maps
+        synth_by_stem: dict[str, int] = {}
+        matched_by_stem: dict[str, int] = {}
+        real_stems: set[str] = set()
+
+        def _stem(p: str) -> str:
+            return pathlib.Path(p).stem
+
+        for idx, entry in enumerate(self.entries):
+            label = int(entry[self.class_column])
+            p = str(entry[self.path_column])
+            is_matched = "matched" in p
+
+            if label == 0:
+                self.real_idx.append(idx)
+                real_stems.add(_stem(p))
+            else:
+                if is_matched:
+                    self.matched_idx.append(idx)
+                    matched_by_stem[_stem(p)] = idx
+                else:
+                    self.synth_idx.append(idx)
+                    synth_by_stem[_stem(p)] = idx
+
+        # ---- Pairing filters ----
+        # 1) Filter matched by synth (old behavior)
+        if self.pair_with_synth:
+            before = len(self.matched_idx)
+            valid = set(synth_by_stem.keys())
+            self.matched_idx = [i for i in self.matched_idx
+                                if _stem(self.entries[i][self.path_column]) in valid]
+            logger.info("Curriculum pairing (matched~synth): %d -> %d", before, len(self.matched_idx))
+
+        # 2) Filter matched & synth by real (NEW)
+        if self.pair_with_real:
+            real_valid = real_stems
+
+            before_m = len(self.matched_idx)
+            self.matched_idx = [i for i in self.matched_idx
+                                if _stem(self.entries[i][self.path_column]) in real_valid]
+            logger.info("Curriculum pairing (matched~real): %d -> %d", before_m, len(self.matched_idx))
+
+            before_s = len(self.synth_idx)
+            self.synth_idx = [i for i in self.synth_idx
+                              if _stem(self.entries[i][self.path_column]) in real_valid]
+            logger.info("Curriculum pairing (synth~real):   %d -> %d", before_s, len(self.synth_idx))
+
+            if self.require_both_for_matched:
+                # keep matched only if it has BOTH a real and a synth partner
+                synth_valid = set(synth_by_stem.keys())
+                before_both = len(self.matched_idx)
+                self.matched_idx = [i for i in self.matched_idx
+                                    if _stem(self.entries[i][self.path_column]) in synth_valid]
+                logger.info("Curriculum pairing (matched requires real & synth): %d -> %d",
+                            before_both, len(self.matched_idx))
+
+        self._epoch_indices: list[int] = []
+        self._current_mix: dict[str, float | int] = {}
+        self.set_epoch(0)
+
+    def __len__(self):
+        return len(self._epoch_indices)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, np.ndarray, int]:
+        mapped_idx: int = self._epoch_indices[idx]
+        return super().__getitem__(mapped_idx)
+
+    def set_epoch(self, epoch: int) -> None:
+        matched_frac: float = float(self.matched_schedule(epoch))
+        matched_frac = max(0.0, min(1.0, matched_frac))
+
+        class1_pool: int = len(self.synth_idx) + len(self.matched_idx)
+        class1_budget: int = min(len(self.real_idx), class1_pool)
+        if class1_budget == 0:
+            self._epoch_indices = []
+            return
+
+        n_matched: int = min(int(round(class1_budget * matched_frac)), len(self.matched_idx))
+        n_synth: int = class1_budget - n_matched
+        if n_synth > len(self.synth_idx):
+            deficit: int = n_synth - len(self.synth_idx)
+            n_synth = len(self.synth_idx)
+            n_matched = min(len(self.matched_idx), n_matched + deficit)
+
+        def _sample(pool: list[int], k: int) -> list[int]:
+            if k <= 0:
+                return []
+            if k <= len(pool):
+                return random.sample(pool, k)
+            return random.choices(pool, k=k)
+
+        chosen_real: list[int] = _sample(self.real_idx, class1_budget)
+        chosen_matched: list[int] = _sample(self.matched_idx, n_matched)
+        chosen_synth: list[int] = _sample(self.synth_idx, n_synth)
+
+        indices: list[int] = chosen_real + chosen_matched + chosen_synth
+        random.shuffle(indices)
+        self._epoch_indices = indices
+
+        self._current_mix = {
+            "epoch": epoch,
+            "matched_fraction": matched_frac,
+            "class0": len(chosen_real),
+            "class1_matched": len(chosen_matched),
+            "class1_synth": len(chosen_synth)
+        }
+        logger.info(
+            "Curriculum | epoch %s | cls0=%s cls1=%s (matched=%s synth=%s) | matched_frac=%.3f",
+            epoch,
+            len(chosen_real),
+            len(chosen_matched) + len(chosen_synth),
+            len(chosen_matched),
+            len(chosen_synth),
+            matched_frac
+        )
+
+    def get_current_mix(self) -> dict[str, float | int]:
+        return self._current_mix
 
 class CSVDatasetTriplet(torch.utils.data.Dataset):
     def __init__(
@@ -208,6 +363,7 @@ class CSVDatasetTriplet(torch.utils.data.Dataset):
 
         # Path of the CSV file is expected to be absolute.
         reader = readers.FileSystemReader(pathlib.Path("/"))
+        self.csv_path= Path(self.csv_path)
         self.entries: list[dict[str, Any]] = reader.read_csv_file(str(self.csv_path))
         self.entries = [e for e in self.entries if e[self.split_column] == self.split]
 
@@ -344,13 +500,14 @@ def build_loader_finetune(config, logger):
     logger.info(f"Train Images Source: {dataset_train.get_dataset_root_path()}")
     logger.info(f"Validation Images Source: {dataset_val.get_dataset_root_path()}")
 
+    curriculum_active: bool = isinstance(dataset_train, CurriculumCSVDataset)
     data_loader_train = DataLoader(
         dataset_train,
         batch_size=config.DATA.BATCH_SIZE,
         num_workers=config.DATA.NUM_WORKERS,
         pin_memory=config.DATA.PIN_MEMORY,
         drop_last=True,
-        shuffle=True,
+        shuffle=not curriculum_active,
         prefetch_factor=config.DATA.PREFETCH_FACTOR
     )
     data_loader_val = DataLoader(
@@ -489,65 +646,117 @@ def build_dataset(
             transform=transform,
             lmdb_storage=pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None
         )
-    elif split_name == "train" and config.TRAIN.LOSS == "supcont":
-        assert config.DATA.AUGMENTED_VIEWS > 1, "SupCon loss requires at least 2 views."
-        dataset = CSVDataset(
-            csv_path,
-            csv_root_dir,
-            split=split_name,
-            transform=transform,
-            views=config.DATA.AUGMENTED_VIEWS,
-            lmdb_storage=pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None
-        )
-    elif split_name == "train" and config.MODEL.RESOLUTION_MODE == "arbitrary":
-        dataset = CSVDataset(
-            csv_path,
-            csv_root_dir,
-            split=split_name,
-            transform=transform,
-            views=config.DATA.AUGMENTED_VIEWS,
-            concatenate_views_horizontally=True,
-            lmdb_storage=pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None
-        )
     else:
-        views_generator: Optional[Callable[[Image.Image], tuple[Image.Image, ...]]]
-        if config.TEST.VIEWS_GENERATION_APPROACH == "tencrop":
-            def safe_ten_crop(img: Image.Image) -> tuple[Image.Image, ...]:
-                width = img.width
-                height = img.height
-                left_padding: int = max((config.DATA.IMG_SIZE - width) // 2, 0)
-                right_padding: int = max(
-                    (config.DATA.IMG_SIZE - width) // 2
-                    + (((config.DATA.IMG_SIZE - width) % 2) if config.DATA.IMG_SIZE > width else 0),
-                    0
-                )
-                top_padding: int = max((config.DATA.IMG_SIZE - height) // 2, 0)
-                bottom_padding: int = max(
-                    (config.DATA.IMG_SIZE - height) // 2
-                    + (((config.DATA.IMG_SIZE - height) % 2) if config.DATA.IMG_SIZE > height else 0),
-                    0
-                )
-                img = pad(img, [left_padding, top_padding, right_padding, bottom_padding])
-                return ten_crop(img, size=config.DATA.IMG_SIZE)
+        dataset_kwargs: dict[str, Any] = {
+            "csv_path": csv_path,
+            "csv_root_path": csv_root_dir,
+            "split": split_name,
+            "transform": transform,
+            "lmdb_storage": pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None
+        }
+        if split_name == "train":
+            use_curriculum: bool = (
+                config.DATA.CURRICULUM.ENABLED
+                and config.TRAIN.LOSS != "triplet"
+            )
+            dataset_cls: type[CSVDataset]
+            if use_curriculum:
+                print("Using CurriculumCSVDataset")
+                dataset_cls = CurriculumCSVDataset
+                dataset_kwargs["matched_schedule"] = build_matched_schedule(config)
+                dataset_kwargs["pair_matched"] = config.DATA.CURRICULUM.PAIR_WITH_SYNTH
+            else:
+                dataset_cls = CSVDataset
 
-            views_generator = safe_ten_crop
-        elif config.TEST.VIEWS_GENERATION_APPROACH is None:
-            views_generator = None
+            if config.TRAIN.LOSS == "supcont":
+                assert config.DATA.AUGMENTED_VIEWS > 1, "SupCon loss requires at least 2 views."
+                dataset_kwargs["views"] = config.DATA.AUGMENTED_VIEWS
+            if config.MODEL.RESOLUTION_MODE == "arbitrary":
+                dataset_kwargs["views"] = config.DATA.AUGMENTED_VIEWS
+                dataset_kwargs["concatenate_views_horizontally"] = True
+            
+            dataset = dataset_cls(**dataset_kwargs)
+            if use_curriculum:
+                logger.info(
+                    "Curriculum enabled | start_matched=%.2f end_matched=%.2f ramp_epochs=%s | pair=%s",
+                    config.DATA.CURRICULUM.START_MATCHED_FRACTION,
+                    config.DATA.CURRICULUM.END_MATCHED_FRACTION,
+                    config.DATA.CURRICULUM.RAMP_EPOCHS,
+                    config.DATA.CURRICULUM.PAIR_WITH_SYNTH
+                )
         else:
-            raise TypeError(f"{config.TEST.VIEW_GENERATION_APPROACH} is not a supported "
-                            f"view generation approach.")
+            views_generator: Optional[Callable[[Image.Image], tuple[Image.Image, ...]]]
+            if config.TEST.VIEWS_GENERATION_APPROACH == "tencrop":
+                def safe_ten_crop(img: Image.Image) -> tuple[Image.Image, ...]:
+                    width = img.width
+                    height = img.height
+                    left_padding: int = max((config.DATA.IMG_SIZE - width) // 2, 0)
+                    right_padding: int = max(
+                        (config.DATA.IMG_SIZE - width) // 2
+                        + (((config.DATA.IMG_SIZE - width) % 2) if config.DATA.IMG_SIZE > width else 0),
+                        0
+                    )
+                    top_padding: int = max((config.DATA.IMG_SIZE - height) // 2, 0)
+                    bottom_padding: int = max(
+                        (config.DATA.IMG_SIZE - height) // 2
+                        + (((config.DATA.IMG_SIZE - height) % 2) if config.DATA.IMG_SIZE > height else 0),
+                        0
+                    )
+                    img = pad(img, [left_padding, top_padding, right_padding, bottom_padding])
+                    return ten_crop(img, size=config.DATA.IMG_SIZE)
 
-        dataset = CSVDataset(
-            csv_path,
-            csv_root_dir,
-            split=split_name,
-            transform=transform,
-            lmdb_storage=pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None,
-            views_generator=views_generator
-        )
+                views_generator = safe_ten_crop
+            elif config.TEST.VIEWS_GENERATION_APPROACH is None:
+                views_generator = None
+            else:
+                raise TypeError(f"{config.TEST.VIEW_GENERATION_APPROACH} is not a supported "
+                                f"view generation approach.")
+
+            dataset = CSVDataset(
+                csv_path,
+                csv_root_dir,
+                split=split_name,
+                transform=transform,
+                lmdb_storage=pathlib.Path(config.DATA.LMDB_PATH) if config.DATA.LMDB_PATH else None,
+                views_generator=views_generator
+            )
     num_classes: int = dataset.get_classes_num()
 
     return dataset, num_classes
+
+
+# def build_matched_schedule(config) -> Callable[[int], float]:
+#     start_f: float = float(config.DATA.CURRICULUM.START_MATCHED_FRACTION)
+#     end_f: float = float(config.DATA.CURRICULUM.END_MATCHED_FRACTION)
+#     ramp_epochs: int = max(1, int(config.DATA.CURRICULUM.RAMP_EPOCHS))
+
+#     def _schedule(epoch: int) -> float:
+#         adj_epoch: int = max(0, epoch - config.TRAIN.START_EPOCH)
+#         alpha: float = min(adj_epoch, ramp_epochs) / ramp_epochs
+#         return start_f + (end_f - start_f) * alpha
+
+#     return _schedule
+def build_matched_schedule(cfg):
+    """
+    First WARMUP_EPOCHS: 0.0
+    Then linearly ramp to END_MATCHED_FRACTION over RAMP_EPOCHS.
+    """
+    start = float(getattr(cfg.DATA.CURRICULUM, "START_MATCHED_FRACTION", 0.0))
+    end   = float(getattr(cfg.DATA.CURRICULUM, "END_MATCHED_FRACTION", 0.15))
+    warm  = int(getattr(cfg.DATA.CURRICULUM, "WARMUP_EPOCHS", 2))
+    ramp  = int(getattr(cfg.DATA.CURRICULUM, "RAMP_EPOCHS", 8))
+
+    # If you want exactly 0.0 for the first two epochs:
+    start = 0.0
+
+    step = (end - start) / max(1, ramp)
+
+    def sched(epoch: int) -> float:
+        if epoch < warm:
+            return 0.0
+        val = start + (epoch - warm) * step
+        return max(0.0, min(end, val))
+    return sched
 
 
 def build_transform(is_train, config) -> Callable[[np.ndarray], np.ndarray]:

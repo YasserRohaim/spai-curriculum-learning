@@ -10,7 +10,8 @@
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF 
+#ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
@@ -22,6 +23,7 @@ import datetime
 from pathlib import Path
 from typing import Optional
 
+import csv
 import numpy as np
 
 import neptune
@@ -30,6 +32,7 @@ import click
 import torch
 import torch.backends.cudnn as cudnn
 import torch.utils.data
+import torch.nn.functional as F
 import yacs
 import filetype
 from torch import nn
@@ -57,6 +60,8 @@ from spai.utils import (
 from spai.models import losses
 from spai import metrics
 from spai import data_utils
+from spai.data.data_finetune import CurriculumCSVDataset
+
 
 try:
     # noinspection PyUnresolvedReferences
@@ -162,7 +167,7 @@ def train(
         "learning_rate": learning_rate,
         "data_path": str(data_path),
         "csv_root_dir": str(csv_root_dir),
-        "lmdb_path": str(lmdb_path),
+        "lmdb_path": str(lmdb_path) if lmdb_path is not None else None,
         "pretrained": str(pretrained) if pretrained is not None else None,
         "resume": resume,
         "accumulation_steps": accumulation_steps,
@@ -178,10 +183,19 @@ def train(
         "data_prefetch_factor": data_prefetch_factor,
         "opts": extra_options
     })
+    config.defrost()
+    if not isinstance(config.TEST.VIEWS_REDUCTION_APPROACH, str):
+        # turn function 'max'/'mean' into its name
+        try:
+            config.TEST.VIEWS_REDUCTION_APPROACH = config.TEST.VIEWS_REDUCTION_APPROACH.__name__
+        except Exception:
+            config.TEST.VIEWS_REDUCTION_APPROACH = "max"
+    config.freeze()
+
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(local_rank)
 
-    if config.AMP_OPT_LEVEL != "O0":
+    if config.AMP_OPT_LEVEL != "O0" and not config.AMP_OPT_LEVEL:
         assert amp is not None, "amp not installed!"
 
     # Set a fixed seed to all the random number generators.
@@ -350,6 +364,14 @@ def test(
         "resize_to": resize_to,
         "opts": extra_options
     })
+    config.defrost()
+    if not isinstance(config.TEST.VIEWS_REDUCTION_APPROACH, str):
+        # turn function 'max'/'mean' into its name
+        try:
+            config.TEST.VIEWS_REDUCTION_APPROACH = config.TEST.VIEWS_REDUCTION_APPROACH.__name__
+        except Exception:
+            config.TEST.VIEWS_REDUCTION_APPROACH = "max"
+    config.freeze()
 
     pathlib.Path(config.OUTPUT).mkdir(exist_ok=True, parents=True)
     global logger
@@ -434,8 +456,7 @@ def test(
 
         if log_writer is not None:
             log_writer.flush()
-        if neptune_run is not None:
-            neptune_run.sync()
+      
 
 
 @cli.command()
@@ -504,6 +525,14 @@ def infer(
         "resize_to": resize_to,
         "opts": extra_options
     })
+    config.defrost()
+    if not isinstance(config.TEST.VIEWS_REDUCTION_APPROACH, str):
+        # turn function 'max'/'mean' into its name
+        try:
+            config.TEST.VIEWS_REDUCTION_APPROACH = config.TEST.VIEWS_REDUCTION_APPROACH.__name__
+        except Exception:
+            config.TEST.VIEWS_REDUCTION_APPROACH = "max"
+    config.freeze()
 
     output.mkdir(exist_ok=True, parents=True)
 
@@ -622,6 +651,14 @@ def tsne(
         "resize_to": resize_to,
         "opts": extra_options
     })
+    config.defrost()
+    if not isinstance(config.TEST.VIEWS_REDUCTION_APPROACH, str):
+        # turn function 'max'/'mean' into its name
+        try:
+            config.TEST.VIEWS_REDUCTION_APPROACH = config.TEST.VIEWS_REDUCTION_APPROACH.__name__
+        except Exception:
+            config.TEST.VIEWS_REDUCTION_APPROACH = "max"
+    config.freeze()
     from spai import tsne as tsne_utils
 
     pathlib.Path(config.OUTPUT).mkdir(exist_ok=True, parents=True)
@@ -667,8 +704,7 @@ def tsne(
 
         if log_writer is not None:
             log_writer.flush()
-        if neptune_run is not None:
-            neptune_run.sync()
+        
 
 
 @cli.command()
@@ -846,6 +882,50 @@ def validate_onnx(
             device=device
         )
 
+## curriculum sanity check helper
+def _assert_curriculum_counts(ds: CurriculumCSVDataset, logger, tol: float = 0.01) -> None:
+    """Recompute composition from ds._epoch_indices and assert it matches logged mix."""
+    idxs = ds._epoch_indices
+    entries = ds.entries
+    path_key = ds.path_column
+    cls_key = ds.class_column
+
+    c0 = c1m = c1s = 0
+    for i in idxs:
+        e = entries[i]
+        label = int(e[cls_key])
+        p = str(e[path_key])
+        if label == 0:
+            c0 += 1
+        else:
+            if "matched" in p:
+                c1m += 1
+            else:
+                c1s += 1
+
+    total = len(idxs)
+    mix = ds.get_current_mix()
+    ok = (c0 == mix["class0"] and c1m == mix["class1_matched"] and c1s == mix["class1_synth"])
+    if not ok:
+        logger.warning(
+            "Curriculum(CHECK) mismatch | computed c0=%d c1m=%d c1s=%d vs mix %s",
+            c0, c1m, c1s, mix
+        )
+
+    # Also check fraction vs schedule (after pool constraints)
+    cls1 = c1m + c1s
+    actual_frac = (c1m / cls1) if cls1 > 0 else 0.0
+    expected_frac = float(mix["matched_fraction"])
+    # When pools are limiting, fractional drift is expected; use a loose tolerance
+    if cls1 > 0 and abs(actual_frac - expected_frac) > tol:
+        logger.info(
+            "Curriculum(FRAC) actual=%.4f expected=%.4f (tol=%.3f) [pool limited? c1=%d]",
+            actual_frac, expected_frac, tol, cls1
+        )
+
+# ========================
+# Training / Validation
+# ========================
 
 def train_model(
     config: yacs.config.CfgNode,
@@ -866,15 +946,39 @@ def train_model(
 ) -> None:
     logger.info("Start training")
 
+    # ----- Early stopping (on by default) -----
+    ES_PATIENCE: int = 6          # stop after N consecutive non-improving epochs
+    ES_MIN_DELTA: float = 0.0     # required improvement in monitored metric
+    best_val_loss: float = float("inf")
+    epochs_no_improve: int = 0
+    # -----------------------------------------
+
     start_time: float = time.time()
     val_accuracy_per_epoch: list[float] = []
     val_ap_per_epoch: list[float] = []
     val_auc_per_epoch: list[float] = []
     val_loss_per_epoch: list[float] = []
 
+    # Prepare consolidated CSV (append across epochs)
+    consolidated_csv = Path(config.OUTPUT) / "val_predictions_all.csv"
+    write_consolidated_header = not consolidated_csv.exists()
+    
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         epoch_start_time: float = time.time()
+        
+       # In train_model(...), right before calling train_one_epoch(...)
+        ds = data_loader_train.dataset
+        if hasattr(ds, "set_epoch") and hasattr(ds, "get_current_mix"):
+            ds.set_epoch(epoch)
+            mix = ds.get_current_mix()
+            logger.info("Curriculum(MIX) | epoch=%d matched_frac=%.3f | cls0=%d | cls1_matched=%d | cls1_synth=%d",
+                        epoch, mix["matched_fraction"], mix["class0"], mix["class1_matched"], mix["class1_synth"])
+            _assert_curriculum_counts(ds, logger, tol=0.01)
+        else:
+            logger.info("Curriculum disabled (dataset: %s)", type(ds).__name__)
 
+        # Strong check: recompute counts from indices and compare
+        
         train_one_epoch(
             config,
             model,
@@ -886,15 +990,21 @@ def train_model(
             log_writer,
             neptune_run
         )
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
         neptune_run["train/last_epoch"] = epoch + 1
         neptune_run["train/epochs_trained"] = epoch + 1 - config.TRAIN.START_EPOCH
 
-        # Validate the model.
+        # ===== Validate the model and request full per-sample details =====
         acc: float
         ap: float
         auc: float
         loss: float
-        acc, ap, auc, loss = validate(config, data_loader_val, model, criterion, neptune_run)
+        acc, ap, auc, loss, predictions, details = validate(
+            config, data_loader_val, model, criterion, neptune_run,
+            return_predictions=True, return_details=True
+        )
         logger.info(f"Val | Epoch {epoch} | Images: {len(dataset_val)} | loss: {loss:.4f}")
         logger.info(f"Val | Epoch {epoch} | Images: {len(dataset_val)} | ACC: {acc:.3f}")
         logger.info(f"Val | Epoch {epoch} | Images: {len(dataset_val)} | AP: {ap:.3f}")
@@ -904,7 +1014,7 @@ def train_model(
         neptune_run["val/accuracy"].append(acc)
         neptune_run["val/loss"].append(loss)
 
-        # Display the best epochs so far.
+        # Track bests for logging
         val_accuracy_per_epoch.append(acc)
         val_ap_per_epoch.append(ap)
         val_auc_per_epoch.append(auc)
@@ -918,39 +1028,118 @@ def train_model(
         logger.info(f"Val | Max AUC: {max(val_auc_per_epoch):.3f} "
                     f"| Epoch: {config.TRAIN.START_EPOCH + np.argmax(val_auc_per_epoch)}")
 
-        # Save only the checkpoints that decrease validation loss.
-        if len(val_loss_per_epoch) == 1 or loss < min(val_loss_per_epoch[:-1]) or save_all:
+        # ===== Save full validation results (per-sample) =====
+        # 2A) Per-epoch standalone CSV
+        per_epoch_csv = Path(config.OUTPUT) / f"val_epoch_{epoch}_preds.csv"
+        with per_epoch_csv.open("w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["epoch", "dataset_index", "image", "target", "prob", "logit", "loss", "pred", "mask_path"])
+            for di in sorted(details.keys()):
+                d = details[di]
+                pred_label = 1 if d["prob"] >= 0.5 else 0
+                w.writerow([
+                    epoch, di, d.get("image", ""), d["target"],
+                    f"{d['prob']:.6f}", f"{d['logit']:.6f}", f"{d['loss']:.6f}",
+                    pred_label, d.get("mask_path", "")
+                ])
+
+        # 2B) Append to consolidated CSV across epochs
+        with consolidated_csv.open("a", newline="") as fh:
+            w = csv.writer(fh)
+            if write_consolidated_header:
+                w.writerow([ "image", "class", "spai"])
+                write_consolidated_header = False
+            for di in sorted(details.keys()):
+                d = details[di]
+                pred_label = 1 if d["prob"] >= 0.5 else 0
+                w.writerow([
+                        d.get("image", ""), d["target"],
+                    f"{d['prob']:.6f}"
+
+                ])
+
+        # 2C) Also write columns back to the dataset CSV (mirrors your test() flow)
+        col_base = f"{config.TAG}_val_epoch_{epoch}"
+        dataset_val.update_dataset_csv(
+            f"{col_base}_prob",
+            {i: d["prob"] for i, d in details.items()},
+            export_dir=Path(config.OUTPUT)
+        )
+        dataset_val.update_dataset_csv(
+            f"{col_base}_logit",
+            {i: d["logit"] for i, d in details.items()},
+            export_dir=Path(config.OUTPUT)
+        )
+        dataset_val.update_dataset_csv(
+            f"{col_base}_loss",
+            {i: d["loss"] for i, d in details.items()},
+            export_dir=Path(config.OUTPUT)
+        )
+        dataset_val.update_dataset_csv(
+            f"{col_base}_pred",
+            {i: int(d["prob"] >= 0.5) for i, d in details.items()},
+            export_dir=Path(config.OUTPUT)
+        )
+        mask_map = {i: d["mask_path"] for i, d in details.items() if d.get("mask_path")}
+        if len(mask_map) == len(details):
+            dataset_val.update_dataset_csv(
+                f"{col_base}_mask", mask_map, export_dir=Path(config.OUTPUT)
+            )
+
+        # ===== Always save a checkpoint each epoch (for resumes) =====
+        # save_checkpoint handles naming (usually includes the epoch number and best tracking).
+        save_checkpoint(config, epoch, model_without_ddp, max(val_accuracy_per_epoch),
+                        optimizer, lr_scheduler, logger)
+
+        # ===== Early stopping (monitoring val loss) =====
+        improved: bool = (loss < (best_val_loss - ES_MIN_DELTA))
+        if improved:
+            best_val_loss = loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= ES_PATIENCE:
+            logger.info(
+                f"Early stopping at epoch {epoch} "
+                f"(no val loss improvement for {ES_PATIENCE} consecutive epoch(s)). "
+                f"Best val loss: {best_val_loss:.4f}"
+            )
+            if neptune_run is not None:
+                neptune_run["train/early_stop_triggered"] = True
+                neptune_run["train/early_stop_epoch"] = epoch
+                neptune_run["train/best_val_loss"] = float(best_val_loss)
+            # Save one more checkpoint at the stopping point just in case
             save_checkpoint(config, epoch, model_without_ddp, max(val_accuracy_per_epoch),
                             optimizer, lr_scheduler, logger)
+            break
 
-        # Test the model.
+        # ===== Optional: run tests each epoch =====
         for test_data_loader, test_dataset, test_data_name in zip(data_loaders_test,
-                                                                  datasets_test,
-                                                                  datasets_test_names):
-            acc, ap, auc, loss = validate(config, test_data_loader, model,
-                                          criterion, neptune_run)
+                                                                    datasets_test,
+                                                                    datasets_test_names):
+            acc_t, ap_t, auc_t, loss_t = validate(config, test_data_loader, model,
+                                                    criterion, neptune_run)
             logger.info(f"Test | {test_data_name} | Epoch {epoch} | Images: {len(test_dataset)} "
-                        f"| loss: {loss:.4f}")
+                        f"| loss: {loss_t:.4f}")
             logger.info(f"Test | {test_data_name} | Epoch {epoch} | Images: {len(test_dataset)} "
-                        f"| ACC: {acc:.3f}")
+                        f"| ACC: {acc_t:.3f}")
             logger.info(f"Test | {test_data_name} | Epoch {epoch} | Images: {len(test_dataset)} "
-                        f"| AP: {ap:.3f}")
+                        f"| AP: {ap_t:.3f}")
             logger.info(f"Test | {test_data_name} | Epoch {epoch} | Images: {len(test_dataset)} "
-                        f"| AUC: {auc:.3f}")
-            neptune_run[f"test/{test_data_name}/acc"].append(acc)
-            neptune_run[f"test/{test_data_name}/ap"].append(ap)
-            neptune_run[f"test/{test_data_name}/auc"].append(auc)
-            neptune_run[f"test/{test_data_name}/loss"].append(loss if not np.isnan(loss) else -100.)
+                        f"| AUC: {auc_t:.3f}")
+            neptune_run[f"test/{test_data_name}/acc"].append(acc_t)
+            neptune_run[f"test/{test_data_name}/ap"].append(ap_t)
+            neptune_run[f"test/{test_data_name}/auc"].append(auc_t)
+            neptune_run[f"test/{test_data_name}/loss"].append(loss_t if not np.isnan(loss_t) else -100.)
 
-        # Compute epoch time.
+        # Timing
         epoch_time: float = time.time() - epoch_start_time
         logger.info(f"Epoch training time: {epoch_time:.3f}s")
         neptune_run["train/epoch_train_time"].append(epoch_time)
 
-        if neptune_run is not None:
-            neptune_run.sync()
 
-    # Compute total training time.
+    # Total training time
     total_time: float = time.time() - start_time
     total_time_str: str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info(f"Overall training time: {total_time_str}")
@@ -968,10 +1157,12 @@ def train_one_epoch(
     log_writer,
     neptune_run
 ):
+   
+
     model.train()
     criterion.train()
     optimizer.zero_grad()
-    
+
     logger.info(
         "Current learning rate for different parameter groups: "
         f"{[it['lr'] for it in optimizer.param_groups]}"
@@ -985,6 +1176,8 @@ def train_one_epoch(
     start = time.time()
     end = time.time()
     for idx, batch in enumerate(data_loader):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
         if isinstance(criterion, TripletMarginLoss):
             anchor, positive, negative = batch
             batch_size: int = anchor.size(0)
@@ -994,28 +1187,31 @@ def train_one_epoch(
             anchor_outputs = model(anchor)
             positive_outputs = model(positive)
             negative_outputs = model(negative)
+            logits = None  # not used in triplet mode
+            targets = None
         else:
             samples, targets, _ = batch
             batch_size: int = samples.size(0)
             samples = samples.cuda(non_blocking=True)
-            targets = targets.cuda(non_blocking=True)
-            # Forward pass each augmented view of the batch separately in order to not
-            # significantly increase memory requirements.
+            targets = targets.cuda(non_blocking=True).float()  # BCE targets must be float
+
+            # Forward each augmented view separately to save memory.
             outputs_views: list[torch.Tensor] = [
                 model(samples[:, i, :, :, :]) for i in range(samples.size(1))
-            ]
-            outputs: torch.Tensor = torch.stack(outputs_views, dim=1)
-            outputs = outputs if outputs.size(dim=1) > 1 else outputs.squeeze(dim=1)
-
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
+            ]  # each: [B, 1]
+            outputs: torch.Tensor = torch.stack(outputs_views, dim=1)  # [B, V, 1]
+            logits: torch.Tensor = outputs.squeeze(-1)  # [B, V]
+            if logits.dim() > 1:
+                # Average predictions across augmented views to match [B] targets.
+                logits = logits.mean(dim=1)
 
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             if isinstance(criterion, TripletMarginLoss):
                 loss = criterion(anchor_outputs, positive_outputs, negative_outputs)
             else:
-                loss = criterion(outputs, targets)
+                loss = criterion(logits, targets)
             loss = loss / config.TRAIN.ACCUMULATION_STEPS
+
             if config.AMP_OPT_LEVEL != "O0":
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
@@ -1029,6 +1225,7 @@ def train_one_epoch(
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
                 else:
                     grad_norm = get_grad_norm(model.parameters())
+
             if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -1037,7 +1234,8 @@ def train_one_epoch(
             if isinstance(criterion, TripletMarginLoss):
                 loss = criterion(anchor_outputs, positive_outputs, negative_outputs)
             else:
-                loss = criterion(outputs.squeeze(), targets)
+                loss = criterion(logits, targets)
+
             optimizer.zero_grad()
             if config.AMP_OPT_LEVEL != "O0":
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -1067,14 +1265,12 @@ def train_one_epoch(
         end = time.time()
 
         lr = optimizer.param_groups[-1]["lr"]
-        loss_value_reduce = loss.cpu().detach().numpy()
-        grad_norm_cpu = (grad_norm.cpu().detach().numpy()
-                         if isinstance(grad_norm, torch.Tensor) else grad_norm)
+        loss_value_reduce = float(loss.detach().cpu().numpy())
+        grad_norm_cpu = (float(grad_norm.detach().cpu().numpy())
+                         if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
 
         if log_writer is not None and (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
+            # Calibrate x-axis across batch sizes.
             epoch_1000x = int((idx / num_steps + epoch) * 1000)
             log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('grad_norm', grad_norm_cpu, epoch_1000x)
@@ -1103,6 +1299,7 @@ def train_one_epoch(
 
 
 @torch.no_grad()
+@torch.no_grad()
 def validate(
     config,
     data_loader,
@@ -1110,8 +1307,20 @@ def validate(
     criterion,
     neptune_run,
     verbose: bool = True,
-    return_predictions: bool = False
+    return_predictions: bool = False,
+    return_details: bool = False,
 ):
+    """Validate and (optionally) return per-sample predictions/details.
+
+    - Computes overall AUC/AP/ACC (as before).
+    - Additionally aggregates metrics per subset inferred from path:
+        * negatives (label=0) -> "real"
+        * positives (label=1) with "matched" in path -> "matched"
+        * other positives -> "synthetic"
+    - Logs per-subset + worst-group metrics to logger and Neptune.
+    """
+    from collections import defaultdict
+
     model.eval()
     criterion.eval()
 
@@ -1119,23 +1328,63 @@ def validate(
     loss_meter = AverageMeter()
     cls_metrics: metrics.Metrics = metrics.Metrics(metrics=("auc", "ap", "accuracy"))
 
+    # Optional outputs
     predicted_scores: dict[int, tuple[float, Optional[AttentionMask]]] = {}
+    details_by_idx: dict[int, dict] = {}
+
+    # For per-subset aggregation (we do it at the end to avoid changing the return signature)
+    subset_probs = defaultdict(list)   # name -> list[float]
+    subset_tgts  = defaultdict(list)   # name -> list[int]
+
+    ds = getattr(data_loader, "dataset", None)
+
+    def _get_img_path(ds_obj, idx: int) -> str:
+        try:
+            if hasattr(ds_obj, "get_image_path"):
+                return str(ds_obj.get_image_path(idx))
+            if hasattr(ds_obj, "get_path"):
+                return str(ds_obj.get_path(idx))
+            for attr in ("df", "data_frame", "_df"):
+                if hasattr(ds_obj, attr):
+                    df = getattr(ds_obj, attr)
+                    cols = getattr(df, "columns", [])
+                    if "image" in cols:
+                        try:
+                            return str(df.loc[idx, "image"])
+                        except Exception:
+                            return str(df.iloc[idx]["image"])
+        except Exception:
+            pass
+        return ""
+
+    def _subset_name(img_path: str, tgt_int: int) -> str:
+        # label 0 is "real" (negatives)
+        if tgt_int == 0:
+            return "real"
+        # label 1 (positives): split by path hint
+        p = (img_path or "").lower()
+        if "matched" in p:
+            return "matched"
+        return "synthetic"
 
     end = time.time()
     for idx, (images, target, dataset_idx) in enumerate(data_loader):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
         if isinstance(images, list):
-            # In case of arbitrary resolution models the batch is provided as a list of tensors.
+            # Arbitrary-resolution path returns list of tensors
             images = [img.cuda(non_blocking=True) for img in images]
-            # Remove views dimension. Always 1 during inference.
-            images = [img.squeeze(dim=1) for img in images]
+            images = [img.squeeze(dim=1) for img in images]  # remove views dim (always 1 at test)
         else:
             images = images.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
 
-        # Compute output.
+        target = target.cuda(non_blocking=True).float()
+
+        # ---- Forward (logits) ----
         if isinstance(images, list) and config.TEST.EXPORT_IMAGE_PATCHES:
             export_dirs: list[pathlib.Path] = [
-                pathlib.Path(config.OUTPUT)/"images"/f"{dataset_idx.detach().cpu().tolist()[i]}"
+                pathlib.Path(config.OUTPUT) / "images" / f"{dataset_idx.detach().cpu().tolist()[i]}"
                 for i in range(len(dataset_idx))
             ]
             output, attention_masks = model(
@@ -1146,40 +1395,73 @@ def validate(
             attention_masks = [None] * len(images)
         else:
             if images.size(dim=1) > 1:
-                predictions: list[torch.Tensor] = [
+                preds_per_view: list[torch.Tensor] = [
                     model(images[:, i]) for i in range(images.size(dim=1))
-                ]
-                predictions: torch.Tensor = torch.stack(predictions, dim=1)
+                ]  # each [B,1]
+                predictions: torch.Tensor = torch.stack(preds_per_view, dim=1)  # [B,V,1]
                 if config.TEST.VIEWS_REDUCTION_APPROACH == "max":
-                    output: torch.Tensor = predictions.max(dim=1).values
+                    output: torch.Tensor = predictions.max(dim=1).values  # [B,1]
                 elif config.TEST.VIEWS_REDUCTION_APPROACH == "mean":
-                    output: torch.Tensor = predictions.mean(dim=1)
+                    output: torch.Tensor = predictions.mean(dim=1)         # [B,1]
                 else:
-                    raise TypeError(f"{config.TEST.VIEWS_REDUCTION_APPROACH} is not a "
-                                    f"supported views reduction approach")
+                    raise TypeError(f"{config.TEST.VIEWS_REDUCTION_APPROACH} is not a supported views reduction approach")
             else:
-                images = images.squeeze(dim=1)  # Remove views dimension.
-                output = model(images)
-            attention_masks = [None] * images.size(0)
+                images = images.squeeze(dim=1)  # Remove views dim.
+                output = model(images)          # [B,1]
+            attention_masks = [None] * output.size(0)
 
-        loss = criterion(output.squeeze(dim=1), target)
+        logits = output.squeeze(dim=1)  # [B]
 
-        # Apply sigmoid to output.
-        output = torch.sigmoid(output)
+        # ---- Loss (per-sample + mean) ----
+        per_sample_loss = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        loss = per_sample_loss.mean()
 
-        # Update metrics.
+        # ---- Probs ----
+        probs = torch.sigmoid(logits)
+
+        # ---- Accumulate overall metrics ----
         loss_meter.update(loss.item(), target.size(0))
-        cls_metrics.update(output[:, 0].cpu(), target.cpu())
+        cls_metrics.update(probs.detach().cpu(), target.cpu())
 
-        # Keep predictions if requested.
-        if return_predictions:
-            batch_predictions: list[float] = output.squeeze(dim=1).detach().cpu().tolist()
-            batch_dataset_idx: list[int] = dataset_idx.detach().cpu().tolist()
-            predicted_scores.update({
-                i: (p, m) for i, p, m in zip(batch_dataset_idx, batch_predictions, attention_masks)
-            })
+        # ---- Collect per-subset data ----
+        batch_idx_list: list[int] = dataset_idx.detach().cpu().tolist()
+        probs_list = probs.detach().cpu().tolist()
+        logits_list = logits.detach().cpu().tolist()
+        loss_list = per_sample_loss.detach().cpu().tolist()
+        tgt_list = [int(t) for t in target.detach().cpu().tolist()]
+        img_paths = []
+        if ds is not None:
+            for di in batch_idx_list:
+                img_paths.append(_get_img_path(ds, di))
+        else:
+            img_paths = [""] * len(batch_idx_list)
 
-        # Measure elapsed time.
+        for pr, tg, path in zip(probs_list, tgt_list, img_paths):
+            name = _subset_name(path, tg)
+            subset_probs[name].append(float(pr))
+            subset_tgts[name].append(int(tg))
+
+        # ---- Optional: store predictions/details ----
+        if return_predictions or return_details:
+            if isinstance(images, list):
+                attn_list = attention_masks
+            else:
+                attn_list = [None] * len(batch_idx_list)
+
+            for i_row, di in enumerate(batch_idx_list):
+                if return_predictions:
+                    predicted_scores[di] = (float(probs_list[i_row]), attn_list[i_row])
+                if return_details:
+                    details_by_idx[di] = {
+                        "prob": float(probs_list[i_row]),
+                        "logit": float(logits_list[i_row]),
+                        "loss": float(loss_list[i_row]),
+                        "target": int(tgt_list[i_row]),
+                        "image": img_paths[i_row],
+                        "mask_path": str(attn_list[i_row].mask) if attn_list[i_row] is not None else ""
+                    }
+
+        # ---- Timing/logging ----
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -1189,17 +1471,55 @@ def validate(
                 f'Test: [{idx}/{len(data_loader)}] | '
                 f'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
                 f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) | '
-                f'Mem {memory_used:.0f}MB')
+                f'Mem {memory_used:.0f}MB'
+            )
 
+    # ---- Overall metrics ----
     metric_values: dict[str, np.ndarray] = cls_metrics.compute()
     auc: float = metric_values["auc"].item()
     ap: float = metric_values["ap"].item()
     acc: float = metric_values["accuracy"].item()
 
+    # ---- Per-subset + worst-group metrics (log only; do not change returns) ----
+    results = {
+        "overall": {"auc": auc, "ap": ap, "acc": acc}
+    }
+
+    # Compute per-subset metrics if available
+    for name in ("real", "synthetic", "matched"):
+        if len(subset_probs.get(name, [])) > 0:
+            subM = metrics.Metrics(metrics=("auc", "ap", "accuracy"))
+            p_t = torch.tensor(subset_probs[name])
+            y_t = torch.tensor(subset_tgts[name])
+            subM.update(p_t, y_t)
+            mv = subM.compute()
+            results[name] = {
+                "auc": float(mv["auc"]),
+                "ap": float(mv["ap"]),
+                "acc": float(mv["accuracy"]),
+            }
+
+    # Worst group across the three (when all exist)
+    if all(k in results for k in ("real", "synthetic", "matched")):
+        worst_auc = min(results["real"]["auc"], results["synthetic"]["auc"], results["matched"]["auc"])
+        worst_ap  = min(results["real"]["ap"],  results["synthetic"]["ap"],  results["matched"]["ap"])
+        worst_acc = min(results["real"]["acc"], results["synthetic"]["acc"], results["matched"]["acc"])
+        results["worst_group"] = {"auc": worst_auc, "ap": worst_ap, "acc": worst_acc}
+
+    # Log nicely
+    for k, v in results.items():
+        logger.info(f"VAL[{k}] AUC={v['auc']:.4f} AP={v['ap']:.4f} ACC={v['acc']:.4f}")
+        if neptune_run is not None:
+            # keep short keys: auc/ap/acc
+            for m in ("auc", "ap", "acc"):
+                neptune_run[f"val/{k}/{m}"].append(v[m])
+
+    # ---- Return same signature as before ----
+    if return_predictions and return_details:
+        return acc, ap, auc, loss_meter.avg, predicted_scores, details_by_idx
     if return_predictions:
         return acc, ap, auc, loss_meter.avg, predicted_scores
-    else:
-        return acc, ap, auc, loss_meter.avg
+    return acc, ap, auc, loss_meter.avg
 
 
 if __name__ == '__main__':

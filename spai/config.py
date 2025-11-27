@@ -66,6 +66,18 @@ _C.DATA.VAL_PREFETCH_FACTOR = None
 # Prefetch factor for test data loaders.
 _C.DATA.TEST_PREFETCH_FACTOR = None
 
+# Curriculum sampling configuration (optional)
+_C.DATA.CURRICULUM = CN()
+_C.DATA.CURRICULUM.ENABLED = False
+# Fractions of matched samples inside class 1 at first/last epoch.
+_C.DATA.CURRICULUM.START_MATCHED_FRACTION = 0.0
+_C.DATA.CURRICULUM.END_MATCHED_FRACTION = 0.5
+# Linear ramp duration in epochs.
+_C.DATA.CURRICULUM.RAMP_EPOCHS = 10
+# Keep matched entries only when a synth counterpart with the same basename exists.
+_C.DATA.CURRICULUM.PAIR_WITH_SYNTH = False
+_C.DATA.CURRICULUM.PAIR_WITH_REAL = True
+_C.DATA.CURRICULUM.REQUIRE_BOTH_FOR_MATCHED=False
 # Filter type, support 'mfm', 'sr', 'deblur', 'denoise'
 _C.DATA.FILTER_TYPE = 'mfm'
 # [MFM] Sampling ratio for low-pass filters
