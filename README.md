@@ -1,41 +1,14 @@
-# SPAI: Spectral AI-Generated Image Detector
-__Official code repository for the CVPR2025 paper [Any-Resolution AI-Generated Image Detection by Spectral Learning](https://openaccess.thecvf.com/content/CVPR2025/html/Karageorgiou_Any-Resolution_AI-Generated_Image_Detection_by_Spectral_Learning_CVPR_2025_paper.html).__
+# SPAI – Curriculum Fine-Tuning & Inference (Project README)
 
-<div align="center";">
+This repository contains our **fine-tuning, curriculum scheduling, multi-epoch inference, and evaluation utilities** built on top of the original SPAI detector.
 
-**Dimitrios Karageorgiou<sup>1,2</sup>, Symeon Papadopoulos<sup>1</sup>, Ioannis Kompatsiaris<sup>1</sup>, Efstratios Gavves<sup>2,3</sup>**
+> **Note:** Base model weights for the original SPAI can be obtained from the **original repository**. Use those as initialization for fine-tuning here.
 
-<sup>1</sup> Information Technologies Institute, CERTH, Greece  
-<sup>2</sup> University of Amsterdam, The Netherlands  
-<sup>3</sup> Archimedes/Athena RC, Greece
+---
 
-</div>
+## 📦 Environment & Setup
 
-<p align="center">
-    <img src="docs/overview.svg" alt="Paper Overview" />
-</p>
-
-**SPAI employs spectral learning to learn the spectral distribution of real 
-images under a self-supervised setup. Then, using the spectral 
-reconstruction similarity it detects AI-generated images as out-of-distribution 
-samples of this learned model.**
-
-### :newspaper: News
-
-- 28/03/25: Code released.
-- 27/02/25: Paper accepted on CVPR2025.
-
-## :hammer: Installation
-
-### Hardware requirements
-
-The code originally targeted Nvidia L40S 48GB GPUs. Nevertheless, many recent cuda-enabled GPUs should be
-supported. Inference should be effortlessly performed with less than 8GB of GPU RAM. However, as training originally
-targeted a 48GB GPU, an equivalent GPU should be present to replicate the paper's training setup. 
-
-### Required libraries
-To train and evaluate SPAI an anaconda environment can be used for installing all the 
-required dependencies as following:
+We use Python 3.11 and CUDA-enabled PyTorch.
 
 ```bash
 conda create -n spai python=3.11
@@ -44,163 +17,179 @@ conda install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvi
 pip install -r requirements.txt
 ```
 
-Furthermore, the installation of [Nvidia APEX](https://github.com/NVIDIA/apex) is required for training.  
+If you plan to train, install [NVIDIA APEX](https://github.com/NVIDIA/apex) (optional but recommended for AMP).
 
-### Weights Checkpoint
+Place the original SPAI weights under `./weights/` (download from the original repo):
 
-The trained weights checkpoint can be downloaded [here](https://drive.google.com/file/d/1vvXmZqs6TVJdj8iF1oJ4L_fcgdQrp_YI/view?usp=sharing) 
-and should be placed under the `weights` directory, located under the project's root directory.
-
-## :fire: Inference
-
-To compute the predicted scores for a set of images, place them under a directory
-and use the following command.
-
-```bash
-python -m spai infer --input <input_dir> --output <output_dir>
+```
+weights/
+└─ mfm_pretrain_vit_base.pth
 ```
 
-where:
-- `input_dir`: is a directory where the input images are located,
-- `output_dir`: is a directory where a csv file with the predictions will be written.
+---
 
-The `--input` option also accepts CSV files containing the paths of the images. The CSV
-files of the evaluation set, included under the `data` directory, can be used as examples.
-For downloading the images of these evaluation CSVs, check the instruction [here](docs/data.md).
+## 🗂️ Datasets
 
-## :triangular_ruler: Architecture Overview
+We train/evaluate from CSVs with at least:
+- `image` (path relative to a root directory),
+- `class` (0 = real, 1 = generated),
+- `split` (e.g., `train`, `val`, `test`).
 
-<p align="center">
-    <img src="docs/architecture.svg" alt="Overview of the SPAI architecture" />
-</p>
+Examples used in our scripts:
+- **SD3**: CSV `stablediffusion3-sd3-v3.csv` with root `stablediffusion3-sid/versions/3`
+- **ITW-SM**: CSV `output/itwsm.csv` with root `ITW-SM/`
 
-We learn a model of the spectral distribution of real images under a self-supervised setup using
-masked spectral learning. Then, we use the spectral reconstruction similarity to measure the divergence from this learned distribution and
-detect AI-generated images as out-of-distribution samples of this model. Spectral context vector captures the spectral context under which
-the spectral reconstruction similarity values are computed, while spectral context attention enables the processing of any-resolution images
-for capturing subtle spectral inconsistencies.
+---
 
-## :muscle: Training
+## 🎯 Fine-Tuning with Curriculum
 
-### Required pre-trained model
-Download the pre-trained ViT-B/16 MFM model from its [public repo](https://github.com/Jiahao000/MFM)
-and place it under the `weights` directory:
-```txt
-weights
-|_ mfm_pretrain_vit_base.pth
-```
+We enable a **matched-vs-synthetic curriculum** during training. We keep the matched fraction at **0.0 for the first 2 epochs** and linearly ramp it to **0.15**.
 
-### Required data
-Latent diffusion training and validation data can be downloaded from their corresponding [repo](https://github.com/grip-unina/DMimageDetection).
-Furthermore, the corresponding instructions for downloading COCO and LSUN should be followed. 
-They should be placed under the `datasets` directory as following:
-```txt
-datasets
-|_latent_diffusion_trainingset
-  |_train
-    ...
-  |_val
-    ...
-|_COCO
-  ...
-|_LSUN
-  ...
-```
+The following config overrides work with our fork:
+- `DATA.CURRICULUM.ENABLED` (bool)
+- `DATA.CURRICULUM.START_MATCHED_FRACTION` (float)
+- `DATA.CURRICULUM.END_MATCHED_FRACTION` (float)
+- `DATA.CURRICULUM.WARMUP_EPOCHS_ZERO` (int, optional; if absent, skip it)
+- `DATA.CURRICULUM.RAMP_EPOCHS` (int)
 
-Then, a csv file describing these data should be created as following:
-
-```bash
-python spai/create_dmid_ldm_train_val_csv.py \
-  --train_dir "./datasets/latent_diffusion_trainingset/train" \
-  --val_dir "./datasets/latent_diffusion_trainingset/val" \
-  --coco_dir "./datasets/COCO" \
-  --lsun_dir "./datasets/LSUN" \
-  -o "./datasets/ldm_train_val.csv"
-```
-
-The validation split can be augmented as following:
-
-```bash
-python spai/tools/augment_dataset.py \
-  --cfg ./configs/vit_base/vit_base__multipatch__100ep__intermediate__restore__patch_proj_per_feature__last_proj_layer_no_activ__fre_orig_branch__all_layers__bce_loss__light_augmentations.yaml \
-  -c ./datasets/ldm_val.csv \
-  -o ./datasets/ldm_val_augm.csv \
-  -d ./datasets/latent_diffusion_trainingset_augm
-```
-
-Then, training can be performed as following:
+### Example: fine-tune with curriculum (SD3 CSV)
 
 ```bash
 python -m spai train \
-  --cfg "./configs/spai.yaml" \
+  --cfg ./configs/spai.yaml \
   --batch-size 72 \
-  --pretrained "./weights/mfm_pretrain_vit_base.pth" \
-  --output "./output/train" \
-  --data-path "./datasets/ldm_train_val.csv" \
-  --tag "spai" \
-  --amp-opt-level "O2" \
+  --pretrained ./weights/mfm_pretrain_vit_base.pth \
+  --output ./output/train \
+  --data-path ./stablediffusion3-sd3-v3.csv \
+  --csv-root-dir ./stablediffusion3-sid/versions/3 \
+  --tag spai_curriculum \
+  --amp-opt-level O2 \
   --data-workers 8 \
   --save-all \
-  --opt "DATA.VAL_BATCH_SIZE" "256" \
-  --opt "MODEL.FEATURE_EXTRACTION_BATCH" "400" \
-  --opt "DATA.TEST_PREFETCH_FACTOR" "1"
+  --opt DATA.CURRICULUM.ENABLED true \
+  --opt DATA.CURRICULUM.START_MATCHED_FRACTION 0.0 \
+  --opt DATA.CURRICULUM.END_MATCHED_FRACTION 0.15 \
+  --opt DATA.CURRICULUM.WARMUP_EPOCHS_ZERO 2 \
+  --opt DATA.CURRICULUM.RAMP_EPOCHS 8
 ```
 
-## :mag_right: Evaluation
+> If your configuration does **not** support `WARMUP_EPOCHS_ZERO`, emulate a 2-epoch flat start by beginning the ramp after epoch 2.
 
-When a model has been trained using the previous script, it can be evaluated as following:
+---
+
+## 🔎 Inference (single run)
+
+Run inference on a CSV (valid for **val/test** splits). This writes an output CSV with predictions to `--output`.
 
 ```bash
-python -m spai test \
-  --cfg "./configs/spai.yaml" \
-  --batch-size 8 \
-  --model "./output/train/finetune/spai/<epoch_name>.pth" \
-  --output "./output/spai/test" \
-  --tag "spai" \
-  --opt "MODEL.PATCH_VIT.MINIMUM_PATCHES" "4" \
-  --opt "DATA.NUM_WORKERS" "8" \
-  --opt "MODEL.FEATURE_EXTRACTION_BATCH" "400" \
-  --opt "DATA.TEST_PREFETCH_FACTOR" "1" \
-  --test-csv "<test_csv_path>"
+python -m spai infer \
+  --cfg ./configs/spai.yaml \
+  --model ./output/train/finetune/spai/ckpt_epoch_X.pth \
+  --input ./stablediffusion3-sd3-v3.csv \
+  --input-csv-root-dir ./stablediffusion3-sid/versions/3 \
+  --split val \
+  --output ./output/sd3_val_infer
 ```
 
-where:
-- `test_csv_path`: Path to a csv file including the paths of the testing data.
-- `epoch_name`: Filename of the epoch selected during validation. 
-
-## :star2: Acknowledgments
-
-This work was partly supported by the Horizon Europe
-projects [ELIAS](https://elias-ai.eu/) (grant no. 101120237) and [vera.ai](https://www.veraai.eu/home) (grant
-no. 101070093). The computational resources were granted
-with the support of [GRNET](https://grnet.gr/en/).
-
-Pieces of code from the [MFM](https://github.com/Jiahao000/MFM) project 
-have been used as a basis for developing this project. We thank its 
-authors for their contribution.
-
-## :black_nib: License & Contact
-
-This project will download and install additional third-party open 
-source software projects. Also, all the employed third-party data 
-retain their original license. Review their license terms 
-before use.  
-
-The source code and model weights of this project are released under 
-the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).
-
-For any question you can contact [d.karageorgiou@uva.nl](mailto:d.karageorgiou@uva.nl). 
-
-## :scroll: Citation
-
-If you found this work useful for your research, you can cite the following paper:
-
-```text
-@inproceedings{karageorgiou2025any,
-  title={Any-resolution ai-generated image detection by spectral learning},
-  author={Karageorgiou, Dimitrios and Papadopoulos, Symeon and Kompatsiaris, Ioannis and Gavves, Efstratios},
-  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
-  pages={18706--18717},
-  year={2025}
-}
+**ITW-SM example:**
+```bash
+python -m spai infer \
+  --cfg ./configs/spai.yaml \
+  --model ./output/train/finetune/spai/ckpt_epoch_X.pth \
+  --input ./output/itwsm.csv \
+  --input-csv-root-dir ./ITW-SM \
+  --split val \
+  --output ./output/itwsm_val_infer
 ```
+
+---
+
+## 🔁 Inference Sweep over Epochs
+
+We provide a POSIX-`sh` compatible script to iterate `ckpt_epoch_0..10.pth` and write per-epoch CSVs.
+
+Create `scripts/infer_sweep.sh`:
+
+```sh
+#!/bin/sh
+CSV_PATH="stablediffusion3-sd3-v3.csv"
+CSV_ROOT="stablediffusion3-sid/versions/3"
+CKPT_DIR="output/sd3_v3/finetune/curriculum_2"
+OUT_BASE="output"
+RUN_CMD="python -m spai infer"
+DATA_FLAGS="--input \"$CSV_PATH\" --input-csv-root-dir \"$CSV_ROOT\" --split val"
+
+i=0
+while [ "$i" -le 10 ]; do
+  CKPT="$CKPT_DIR/ckpt_epoch_${i}.pth"
+  OUTDIR="$OUT_BASE/curriculum_epoch$i"
+  [ -f "$CKPT" ] || { echo "[warn] $CKPT missing"; i=$((i+1)); continue; }
+  mkdir -p "$OUTDIR"
+  echo "[info] epoch $i -> $OUTDIR"
+  eval $RUN_CMD --cfg configs/spai.yaml --model \"$CKPT\" $DATA_FLAGS --output \"$OUTDIR\"
+  i=$((i+1))
+done
+echo "[done] processed epochs 0..10"
+```
+
+Make executable and run:
+```bash
+chmod +x scripts/infer_sweep.sh
+sh scripts/infer_sweep.sh
+```
+
+To run on **ITW-SM**, change in the script:
+```
+CSV_PATH="output/itwsm.csv"
+CSV_ROOT="ITW-SM/"
+```
+
+---
+
+## 📊 Evaluation & Plots
+
+We provide two utilities:
+
+### 1) Multi-epoch evaluation
+
+Evaluates epoch directories `output/curriculum_epoch{0..10}/stablediffusion3-sd3-v3.csv`, computing:
+- **ACC@0.5**, **Oracle-ACC** (best threshold), **AUC**, **TPR**, **TNR** (standard rates, not at oracle),
+- Subsets: **real+matched**, **real+synthetic**,
+- Optional **TOTAL** (e.g., full ≈15k) if present in the file,
+- Saves a summary CSV and plots under `metric_output/`.
+
+```bash
+python evaluate_epochs.py \
+  --root output \
+  --basename curriculum_epoch \
+  --start 0 --end 10 \
+  --pred-csv-name stablediffusion3-sd3-v3.csv \
+  --out metric_output
+```
+
+### 2) Single-CSV evaluation
+
+If you have a single predictions file (e.g., `output/stablediffusion3-sd3-v3.csv`):
+
+```bash
+python evaluate_single.py \
+  --csv output/stablediffusion3-sd3-v3.csv \
+  --out metric_output_single
+```
+
+Both scripts expect the prediction CSV to include ground-truth (`class`) and a score/probability column (written by `spai infer` under your `--tag`, default `spai`).
+
+---
+
+
+
+## 🙏 Acknowledgments
+
+- Original SPAI paper & repository authors for the base model and training code.
+- Our repo extends SPAI with curriculum fine-tuning utilities, sweep inference, and evaluation tooling tailored to our datasets.
+
+---
+
+## 📄 License
+
+Our additions follow the same license terms as the original project (Apache-2.0). Third-party datasets and dependencies retain their respective licenses. Review and comply with their terms before use.
